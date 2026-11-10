@@ -34,10 +34,15 @@
   uniform float uLdr;    // 1 when HDR render targets are unavailable
   out vec4 outColor;
 
+  const float PI = 3.14159265;
   const float MAXH = 2.6;
   const float TMAX = 280.0;
-  const vec3 MOON = normalize(vec3(-0.4, 0.27, -0.88));
   const vec3 F0 = vec3(0.9, 0.9, 0.93);   // polished silver / mercury
+  const float ER = 0.034;                 // angular radius of the eclipse disc
+
+  // Per-frame values that only depend on the eclipse position; set at the top of main().
+  float gVis;    // eclipse visibility (fades as it sinks below the horizon)
+  float gGlow;   // horizon glow, strongest when the eclipse touches the horizon
 
   // Heavy, slow swells. Small ripples are damped (surface tension) and
   // move only a little faster than the big waves, so the liquid feels dense.
@@ -96,70 +101,114 @@
     return false;
   }
 
+  // ---- Noise ----
   float hash2(vec2 p) {
     p = fract(p * vec2(123.34, 456.21));
     p += dot(p, p + 45.32);
     return fract(p.x * p.y);
   }
 
-  vec3 stars(vec3 d) {
-    if (d.y < 0.0) return vec3(0.0);
-    vec2 sc = vec2(atan(d.x, -d.z), asin(clamp(d.y, -1.0, 1.0))) * 90.0;
-    vec2 id = floor(sc);
-    float h = hash2(id);
-    if (h < 0.93) return vec3(0.0);
-    vec2 off = (vec2(hash2(id + 7.1), hash2(id + 3.7)) - 0.5) * 0.6;
-    float r = length(fract(sc) - 0.5 - off);
-    float twinkle = 0.7 + 0.3 * sin(uTime * (1.0 + h * 3.0) + h * 40.0);
-    float bright = 0.25 + 2.5 * pow(fract(h * 91.7), 5.0);
-    vec3 tint = mix(vec3(0.75, 0.85, 1.0), vec3(1.0, 0.9, 0.75), fract(h * 13.3));
-    return tint * smoothstep(0.16, 0.0, r) * bright * twinkle * smoothstep(0.0, 0.12, d.y);
+  float vnoise(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    float a = hash2(i), b = hash2(i + vec2(1.0, 0.0));
+    float c = hash2(i + vec2(0.0, 1.0)), d = hash2(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
   }
 
-  // Environment reflected by the metal. Blends from a sunset palette to night as the sun sinks.
-  // studio = 1 for reflections (adds light panels), 0 when looking at the sky directly.
-  vec3 sky(vec3 d, float studio) {
-    float y = d.y;
-    float sunY = uSun.y;
-    float day = smoothstep(-0.14, 0.06, sunY);   // 1 = golden hour, 0 = full night
-    float night = 1.0 - day;
+  float fbm(vec2 p) {
+    float s = 0.0, a = 0.5;
+    for (int i = 0; i < 5; i++) {
+      s += a * vnoise(p);
+      p = p * 2.03 + vec2(17.1, 9.7);
+      a *= 0.5;
+    }
+    return s;
+  }
 
-    vec3 top = mix(vec3(0.002, 0.003, 0.009), vec3(0.006, 0.008, 0.02), day);
-    vec3 mid = mix(vec3(0.007, 0.01, 0.028), vec3(0.05, 0.05, 0.10), day);
-    vec3 hor = mix(vec3(0.035, 0.05, 0.095), vec3(0.75, 0.44, 0.32), day);
-    vec3 c = mix(hor, mid, smoothstep(0.0, 0.12, y));
-    c = mix(c, top, smoothstep(0.12, 0.7, y));
+  // ---- Eclipse void ----
+  // uSun is the direction of the eclipse: a black disc with a white-hot rim and corona.
 
-    // Afterglow: a red band on the horizon around the sun's azimuth that lingers after sunset.
+  void setupSun() {
+    float sy = uSun.y;
+    gVis = smoothstep(-0.12, 0.0, sy);
+    gGlow = exp(-abs(sy) * 11.0);
+  }
+
+  // The dark itself: near-black, a breath lighter toward the horizon,
+  // with a faint pale bloom on the horizon beneath the eclipse.
+  vec3 atmosphere(vec3 d) {
+    float y = max(d.y, 0.0);
+    vec3 c = mix(vec3(0.0012, 0.0013, 0.0018), vec3(0.0045, 0.0048, 0.006), exp(-y * 7.0));
     float toward = max(dot(normalize(d.xz + 1e-5), normalize(uSun.xz + 1e-5)), 0.0);
-    float afterglow = smoothstep(-0.3, -0.02, sunY) * (1.0 - smoothstep(0.02, 0.14, sunY));
-    c += vec3(0.9, 0.32, 0.14) * pow(toward, 3.0) * exp(-max(y, 0.0) * 10.0) * afterglow * 0.7;
+    c += vec3(0.75, 0.8, 0.9) * pow(toward, 10.0) * exp(-y * 22.0) * 0.045 * gGlow;
+    return c;
+  }
 
-    // Light panels for the chrome to catch: bright and warm by day, faint and cool by night.
-    float az = atan(d.x, -d.z);
-    float panels = pow(0.5 + 0.5 * sin(az * 5.0 + 0.6), 40.0);
-    vec3 panelCol = mix(vec3(0.25, 0.32, 0.5) * 0.25, vec3(0.7, 0.8, 1.0) * 1.1, day);
-    c += studio * panelCol * panels * smoothstep(0.06, 0.2, y) * (1.0 - smoothstep(0.4, 0.65, y));
-    c += studio * panelCol * 0.55 * (1.0 - smoothstep(0.0, 0.05, abs(d.x))) * smoothstep(0.6, 0.85, y);
+  vec3 grain(vec3 d, float density, float threshold, float size, float gain) {
+    vec2 sc = vec2(atan(d.x, -d.z), asin(clamp(d.y, -1.0, 1.0))) * density;
+    vec2 id = floor(sc);
+    float h = hash2(id);
+    if (h < threshold) return vec3(0.0);
+    vec2 off = (vec2(hash2(id + 7.1), hash2(id + 3.7)) - 0.5) * 0.6;
+    float r = length(fract(sc) - 0.5 - off);
+    float bright = 0.15 + pow(fract(h * 91.7), 10.0) * 6.0;
+    return vec3(0.85, 0.88, 1.0) * smoothstep(size, 0.0, r) * bright * gain;
+  }
 
-    // A thin bright horizon line.
-    c += mix(vec3(0.3, 0.38, 0.55) * 0.25, vec3(1.0, 0.8, 0.65) * 0.7, day) * exp(-abs(y) * 80.0);
+  // Returns the eclipse light; occl is 1 inside the black disc.
+  vec3 eclipse(vec3 d, out float occl) {
+    occl = 0.0;
+    float cosT = dot(d, uSun);
+    if (cosT < 0.97) return vec3(0.0);
+    float r = sqrt(max(2.0 * (1.0 - cosT), 0.0)) / ER;
+    occl = 1.0 - smoothstep(0.985, 1.0, r);
 
-    // Sun glow + disc, fading out as it dips below the horizon.
-    float s = max(dot(d, uSun), 0.0);
-    float glowVis = smoothstep(-0.16, 0.02, sunY);
-    float discVis = smoothstep(-0.02, 0.02, sunY) * smoothstep(-0.01, 0.01, y);
-    c += vec3(1.0, 0.55, 0.32) * pow(s, 16.0) * 0.35 * glowVis;
-    c += vec3(1.0, 0.85, 0.7) * pow(s, 220.0) * 1.4 * glowVis;
-    c += vec3(1.0, 0.95, 0.88) * pow(s, 900.0) * 12.0 * discVis;
+    vec3 eR = normalize(cross(uSun, vec3(0.0, 1.0, 0.0)));
+    vec3 eU = cross(eR, uSun);
+    vec2 dir = normalize(vec2(dot(d, eR), dot(d, eU)) + 1e-6);
 
-    // Night: stars and a moon.
-    c += stars(d) * night * night;
-    float mo = dot(d, MOON);
-    c += vec3(0.75, 0.82, 1.0) * (smoothstep(0.99935, 0.9996, mo) * 2.2 + pow(max(mo, 0.0), 120.0) * 0.12 + pow(max(mo, 0.0), 12.0) * 0.03) * night;
+    float outside = smoothstep(0.97, 1.0, r);
+    // Razor rim + a slightly softer inner glow.
+    float rim = (exp(-pow((r - 1.0) * 40.0, 2.0)) * 14.0 + exp(-pow((r - 1.0) * 9.0, 2.0)) * 1.6) * outside;
+    // Corona: streamers that drift very slowly.
+    float s1 = fbm(dir * 2.2 + vec2(uTime * 0.015, 0.0));
+    float s2 = vnoise(dir * 9.0 - vec2(0.0, uTime * 0.02));
+    float streamers = 0.35 + 1.4 * pow(s1, 2.5) + 0.5 * pow(s2, 4.0);
+    float rr = max(r, 1.0);
+    float corona = (pow(rr, -4.0) * 1.6 + pow(rr, -2.0) * 0.06) * streamers * outside;
+    return vec3(1.0, 0.97, 0.93) * rim + vec3(0.82, 0.88, 1.0) * corona;
+  }
+
+  // Everything above the sea. studio = 1 for reflections (adds thin light strips for the chrome).
+  vec3 sky(vec3 d, float studio) {
+    vec3 c = atmosphere(d);
+    float y = d.y;
+    float above = smoothstep(-0.002, 0.002, y);
+
+    // The horizon: one razor-thin line of light, brighter toward the eclipse.
+    float toward = max(dot(normalize(d.xz + 1e-5), normalize(uSun.xz + 1e-5)), 0.0);
+    float lineI = 0.22 + 3.0 * pow(toward, 8.0) * gGlow;
+    c += vec3(0.88, 0.91, 1.0) * lineI * (exp(-abs(y) * 700.0) + exp(-abs(y) * 90.0) * 0.025);
+
+    // Fine grain stars, hidden behind the disc.
+    float occl;
+    vec3 e = eclipse(d, occl);
+    float starVis = (1.0 - occl) * smoothstep(0.01, 0.08, y);
+    if (starVis > 0.0) {
+      c += starVis * (grain(d, 320.0, 0.86, 0.2, 0.05) + grain(d, 130.0, 0.975, 0.14, 0.35));
+    }
+    c = c * (1.0 - occl * above) + e * above * gVis;
+
+    // Thin vertical light strips, seen only in the metal: razor highlights on the swells.
+    if (studio > 0.0) {
+      float az = atan(d.x, -d.z);
+      float strips = pow(0.5 + 0.5 * sin(az * 3.0 + 0.9), 4000.0);
+      c += vec3(0.8, 0.85, 1.0) * strips * smoothstep(0.03, 0.12, y) * (1.0 - smoothstep(0.35, 0.6, y)) * 0.18;
+    }
 
     // Below the horizon (reflections pointing down) falls into darkness.
-    c = mix(c, vec3(0.015, 0.016, 0.03) * mix(0.3, 1.0, day), 1.0 - smoothstep(-0.25, 0.0, y));
+    c = mix(c, vec3(0.002, 0.002, 0.003), 1.0 - smoothstep(-0.25, 0.0, y));
     return c;
   }
 
@@ -168,16 +217,15 @@
     return F0 + (1.0 - F0) * pow(1.0 - ndv, 5.0);
   }
 
-  // Sharp sun / moon glints on a surface point.
+  // Razor glints of the eclipse rim on the surface.
   vec3 glints(vec3 n, vec3 rd) {
-    float day = smoothstep(-0.14, 0.06, uSun.y);
-    vec3 hs = normalize(uSun - rd);
-    vec3 hm = normalize(MOON - rd);
-    return vec3(1.0, 0.85, 0.7) * pow(max(dot(n, hs), 0.0), 600.0) * 6.0 * smoothstep(-0.02, 0.03, uSun.y)
-         + vec3(0.75, 0.85, 1.0) * pow(max(dot(n, hm), 0.0), 900.0) * 2.5 * (1.0 - day);
+    vec3 h = normalize(uSun - rd);
+    float nh = max(dot(n, h), 0.0);
+    return vec3(1.0, 0.97, 0.93) * (pow(nh, 1400.0) * 9.0 + pow(nh, 160.0) * 0.12) * gVis;
   }
 
   void main() {
+    setupSun();
     vec2 uv = (gl_FragCoord.xy * 2.0 - uRes) / uRes.y;
 
     float yaw = uLook.x, pit = uLook.y;
@@ -188,10 +236,11 @@
     vec3 ro = uCam;
 
     // Horizon colour along this azimuth, used for fog.
-    vec3 horizon = sky(normalize(vec3(rd.x, 0.015, rd.z)), 0.0);
+    vec3 horizon = atmosphere(normalize(vec3(rd.x, 0.01, rd.z)));
 
     vec3 col;
     float t;
+    float glowMask = 1.0;   // alpha: 0 inside the eclipse disc so bloom can't fill it
     if (march(ro, rd, 0.0, TMAX, 180, t)) {
       vec3 p = ro + rd * t;
       vec3 n = normalAt(p.xz, t);
@@ -209,7 +258,7 @@
         vec3 refl2 = reflect(refl, n2);
         vec3 second = sky(refl2, 1.0) * fresnel(n2, refl) + glints(n2, refl);
         // Distant self-reflections fade into the horizon haze.
-        second = mix(second, sky(normalize(vec3(refl.x, 0.015, refl.z)), 0.0), 1.0 - exp(-t2 * 0.02));
+        second = mix(second, atmosphere(normalize(vec3(refl.x, 0.01, refl.z))), 1.0 - exp(-t2 * 0.02));
         env = mix(env, second, selfW);
       }
 
@@ -221,10 +270,15 @@
       col = mix(col, horizon, fog * fog);
     } else {
       col = rd.y < 0.0 ? horizon : sky(rd, 0.0);
+      if (rd.y > 0.0) {
+        float occl;
+        eclipse(rd, occl);
+        glowMask = 1.0 - occl;
+      }
     }
 
     col = max(col, 0.0);
-    outColor = vec4(uLdr > 0.5 ? sqrt(min(col, 8.0) / 8.0) : col, 1.0);
+    outColor = vec4(uLdr > 0.5 ? sqrt(min(col, 8.0) / 8.0) : col, glowMask);
   }`;
 
   // ---------------------------------------------------------------- bloom
@@ -281,14 +335,15 @@
   }
   void main() {
     vec2 q = gl_FragCoord.xy / uRes;
-    vec3 s = texture(uScene, q).rgb;
+    vec4 s4 = texture(uScene, q);
+    vec3 s = s4.rgb;
     vec3 col = uLdr > 0.5 ? s * s * 8.0 : s;
-    col += texture(uBloom, q).rgb / uEnc * 0.6;
+    col += texture(uBloom, q).rgb / uEnc * 0.6 * s4.a;   // alpha masks the eclipse disc
 
     col = aces(col * 1.05);
     col *= 0.6 + 0.4 * pow(16.0 * q.x * q.y * (1.0 - q.x) * (1.0 - q.y), 0.18);
     col = pow(col, vec3(1.0 / 2.2));
-    col += (hash(gl_FragCoord.xy + fract(uTime)) - 0.5) / 255.0;
+    col += (hash(gl_FragCoord.xy + fract(uTime)) - 0.5) * 3.5 / 255.0;   // fine film grain
     outColor = vec4(col, 1.0);
   }`;
 
@@ -395,20 +450,10 @@
   window.addEventListener('pointerdown', (e) => lookAt(e.clientX, e.clientY));
   document.addEventListener('mouseleave', () => { targetYaw = 0; targetPitch = BASE_PITCH; });
 
-  // ---- Sun cycle ----
-  // The sun bobs between just above the horizon and well below it, so it never climbs high.
-  const CYCLE = 60;           // seconds for a full set → night → rise → set loop
-  const SUN_HIGH = 0.16;      // max elevation (radians, ~9°)
-  const SUN_LOW = -0.32;      // lowest point during the night
-  // Optional ?t=<seconds> skips ahead in the cycle (handy for previewing night).
-  const cycleOffset = parseFloat(new URLSearchParams(location.search).get('t')) || 0;
-
-  function sunDirection(time) {
-    const phase = ((time + cycleOffset) / CYCLE) * Math.PI * 2;
-    const elev = SUN_LOW + (SUN_HIGH - SUN_LOW) * (0.5 + 0.5 * Math.cos(phase));
-    const az = Math.sin(phase * 0.5) * 0.12;   // a slight drift in where it sets and rises
-    return [Math.sin(az) * Math.cos(elev), Math.sin(elev), -Math.cos(az) * Math.cos(elev)];
-  }
+  // ---- Eclipse ----
+  // Fixed in the sky, dead ahead in the direction of travel, a little above the horizon.
+  const ECLIPSE_ELEVATION = 0.13;   // radians (~7.5°)
+  const ECLIPSE_DIR = [0, Math.sin(ECLIPSE_ELEVATION), -Math.cos(ECLIPSE_ELEVATION)];
 
   // ---- Render passes ----
   function bindTarget(t) {
@@ -494,7 +539,7 @@
     // Gentle drift so the ride feels like floating.
     const cam = [Math.sin(time * 0.07) * 6.0, 4.2 + Math.sin(time * 0.35) * 0.35, -time * SPEED];
     const look = [yaw, pitch + Math.sin(time * 0.5) * 0.015];
-    render(time, cam, look, sunDirection(time));
+    render(time, cam, look, ECLIPSE_DIR);
 
     // Adapt resolution every ~40 frames.
     accum += dt; frames++;

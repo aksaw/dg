@@ -1,14 +1,14 @@
 # Infinite Futures
 
-An endless, undulating ocean of liquid metal. The camera drifts forward forever; move the cursor to look around (drag on touch screens).
+An endless, undulating ocean of liquid metal under an eclipse. The camera drifts forward forever; move the cursor to look around (drag on touch screens).
 
-The sun sets into a starry, moonlit night and rises again on a 1-minute loop, never climbing far above the horizon. Add `?t=30` to the URL to skip ahead in the cycle (30 = midnight).
+The sky is a near-black void: a fixed total eclipse (a black disc with a white-hot rim and drifting corona) hangs ahead, above a single razor-thin horizon line and fine grain stars. The chrome reflects mostly darkness and a few sharp highlights. A realistic-sky version lives in [`../infinite-futures-realistic/`](../infinite-futures-realistic/).
 
-It's a single full-screen WebGL2 fragment shader (raymarched heightfield + metallic reflections), with no dependencies and no build step.
+It's WebGL2 with no dependencies and no build step: a raymarched scene shader (with the metal reflecting itself) plus a small bloom pass.
 
 ## Run locally
 
-Open `index.html` directly, or serve the folder:
+Serve the repo root and open `/infinite-futures/`:
 
 ```bash
 python -m http.server 8000
